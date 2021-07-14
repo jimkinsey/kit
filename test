@@ -1,0 +1,359 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+WORKING_DIR=$(pwd)
+TEST_AREA="${WORKING_DIR}/test-area"
+TEST_REPO="${TEST_AREA}/local-repo"
+REMOTE_REPO="${TEST_AREA}/remote-repo"
+COLLABORATOR_REPO="${TEST_AREA}/collab-repo"
+
+# Sets up the test area with a local git repo and a "remote" in the same dir so that pushes and pulls can be run
+setup() {
+
+  # Create the fake remote
+  mkdir -p "${REMOTE_REPO}"
+  cd "${REMOTE_REPO}"
+  git init -q
+  git config --bool core.bare true # Allows commits to this as a remote - I don't understand why, here's the SO question I got it from: https://stackoverflow.com/questions/2816369/git-push-error-remote-rejected-master-master-branch-is-currently-checked
+  
+  # Create the local repo
+  mkdir -p "${TEST_REPO}"
+  cd "${TEST_REPO}"
+  git init -q
+  
+  git remote add origin "file://${REMOTE_REPO}/.git"
+  
+  # Set up the local repo with the bare minimum so that from this point on "git pull", "git push", etc. can be used as per normal
+  echo ".kit" >> .gitignore
+  git add .
+  git commit -q -am"Initialised empty repo"
+  git push -q --set-upstream origin master
+  # mkdir -p .kit
+  
+  # Create the collaborator repo
+  mkdir -p "${COLLABORATOR_REPO}"
+  cd "${COLLABORATOR_REPO}"
+  git init -q
+  # mkdir -p .kit
+  
+  git remote add origin "file://${REMOTE_REPO}/.git"
+  
+  git pull -qr origin master
+  git branch -q --set-upstream-to=origin/master
+  
+  # Want to generally start from the local repo
+  cd "${TEST_REPO}"
+}
+
+# Removes the test area used while testing
+teardown() {
+  rm -rf "${TEST_AREA}"
+}
+
+# Executes a test, providing appropriate feedback
+run_test() {
+  local TEST=$1
+  
+  printf "Running test [${TEST}]..."
+  
+  teardown 1> /dev/null # tear-down before setup so that the test area remains available for debugging
+  setup 1> /dev/null
+  
+  $2
+
+  printf "PASSED\n"
+}
+
+# Asserts that the two passed string parameters are equal, exiting with a message and a non-zero status code if they are not
+assert_equal() {
+  local ACTUAL=$1
+  local EXPECTED=$2
+
+  if [ "${EXPECTED}" != "${ACTUAL}" ]; then
+    echo "FAILED: Expected [${EXPECTED}], got [${ACTUAL}]"    
+    exit 1
+  fi
+}
+
+# Asserts that the second string parameter is a substring of the first
+assert_includes() {
+  local STRING=$1
+  local SUBSTRING=$2
+  
+  if [[ "${STRING}" != *"${SUBSTRING}"* ]]; then
+    echo "FAILED: [${SUBSTRING}] is not a substring of [${STRING}]"
+    exit 1
+  fi
+}
+
+# Asserts that there are no unpushed commits in the local repo
+assert_no_unpushed_commits() {
+  local UNPUSHED_COUNT=$(git log --oneline @{u}.. | wc -l | awk {'print $1'})
+  
+  if [ "${UNPUSHED_COUNT}" != "0" ]; then
+    echo "FAILED: Expectd no unpushed commits, but found ${UNPUSHED_COUNT}"
+    exit 1
+  fi 
+}
+
+# Asserts that the last local commit message matches the parameter
+assert_last_commit_message() {
+  local EXPECTED=$1
+  local ACTUAL=$(git log --format=%B -n 1)
+  
+  assert_equal "${ACTUAL}" "${EXPECTED}"
+}
+
+assert_last_commit_files() {
+  local EXPECTED=$1
+  local ACTUAL=$(git log --name-status -n 1  | grep -E '^[A-Z]\b' | awk {'print $2'})
+  
+  assert_equal "${ACTUAL}" "${EXPECTED}"
+}
+
+assert_file_exists() {
+  local FILE=$1
+  
+  if ! test -f "$1" ; then
+    echo "FAILED: File $FILE does not exist"
+    exit 1
+  fi
+}
+
+assert_file_doesnt_exist() {
+  local FILE=$1
+  
+  if test -f "$1" ; then
+    echo "FAILED: File $FILE exists"
+    exit 1
+  fi
+}
+
+assert_dir_exists() {
+  local DIR=$1
+  
+  if ! test -d "$1" ; then
+    echo "FAILED: Directory $DIR does not exist"
+    exit 1
+  fi
+}
+
+LAST_OUTPUT=""
+LAST_EXIT_CODE=0
+
+# Runs the kit command, output stored in LAST_OUTPUT and exit code in LAST_EXIT_CODE
+run_kit() {
+  local COMMAND=$1
+  
+  LAST_OUTPUT=""
+  LAST_EXIT_CODE=0
+  LAST_OUTPUT=$(${WORKING_DIR}/kit ${COMMAND})
+  LAST_EXIT_CODE=$?
+}
+
+# Tests:
+
+test_begin_no_change_in_progress() {
+  run_kit init
+  run_kit begin <<< "A test change"
+  
+  run_kit current
+  
+  assert_equal "${LAST_OUTPUT}" "A test change"
+}
+
+test_begin_change_in_progress() {
+  run_kit init
+  run_kit begin <<< "The first change"
+  
+  run_kit begin <<< "The second change"
+
+  assert_equal "${LAST_OUTPUT}" "A change is already in-progress!"
+}
+
+test_backout_no_change_in_progress() {
+  run_kit init
+  run_kit backout
+
+  assert_includes "${LAST_OUTPUT}" "No change is currently in progress!"
+}
+
+test_backout_change_in_progress() {
+  run_kit init
+  run_kit begin <<< "A change"
+  
+  echo "Content" > content.md
+  
+  run_kit backout
+  
+  assert_file_doesnt_exist "content.md"
+}
+
+test_backout_with_remote_changes() {
+  cd "${COLLABORATOR_REPO}"
+  run_kit init
+  run_kit begin <<< "Start with a killer first line"
+  echo "It was a dark and stormy night" > novel.txt
+  run_kit integrate
+  
+  cd "${TEST_REPO}"
+  run_kit init
+  run_kit begin <<< "First line!"
+  echo "The clock struck midnight" > novel.txt
+  
+  run_kit backout
+  
+  assert_last_commit_message "Start with a killer first line"
+  assert_no_unpushed_commits
+}
+  
+test_current_no_change_in_progress() {
+  run_kit init
+  run_kit current
+  
+  assert_equal "${LAST_OUTPUT}" "No change is currently in-progress!"
+}
+
+test_integrate_no_changes_either_side() {
+  run_kit init
+  run_kit integrate
+  
+  assert_equal "${LAST_OUTPUT}" "No incoming changes to integrate with"
+}
+
+test_integrate_local_change() {
+  run_kit init
+  run_kit begin <<< "Start with a killer first line"
+  
+  echo "It was a dark and stormy night" > novel.txt
+
+  run_kit integrate
+  
+  assert_no_unpushed_commits
+  assert_last_commit_message "Start with a killer first line"
+  assert_last_commit_files "novel.txt"
+  
+  run_kit current
+  
+  assert_equal "${LAST_OUTPUT}" "No change is currently in-progress!"
+}
+
+test_integrate_non_local_changes() {
+  cd "${COLLABORATOR_REPO}"
+  run_kit init
+  run_kit begin <<< "Start with a killer first line"
+  echo "It was a dark and stormy night" > novel.txt
+  run_kit integrate
+  
+  cd "${TEST_REPO}"
+  run_kit init
+  run_kit integrate
+  
+  assert_includes "${LAST_OUTPUT}" "Start with a killer first line"
+  assert_last_commit_message "Start with a killer first line"
+  assert_file_exists "novel.txt"
+}
+
+test_integrate_local_and_remote_changes() {
+  cd "${COLLABORATOR_REPO}"
+  run_kit init
+  run_kit begin <<< "Add build script"
+  echo "dune build customer-details.exe" > build.sh
+  run_kit integrate
+  
+  cd "${TEST_REPO}"
+  run_kit init
+  run_kit begin <<< "Add README"
+  echo "# Customer details service" > README.md
+  run_kit integrate
+  
+  assert_includes "${LAST_OUTPUT}" "Add build script"
+  assert_no_unpushed_commits
+  assert_last_commit_message "Add README"
+  assert_file_exists "build.sh"
+}
+
+test_integrate_with_conflict() {
+  cd "${COLLABORATOR_REPO}"
+  run_kit init
+  run_kit begin <<< "Add build script and empty README"
+  echo "dune build customer-details.exe" > build.sh
+  echo "" > README.md
+  run_kit integrate
+  
+  cd "${TEST_REPO}"
+  run_kit init
+  run_kit begin <<< "Add README"
+  echo "# Customer details service" > README.md
+  run_kit integrate
+  
+  assert_includes "${LAST_OUTPUT}" "There are conflicts with an incoming change"
+  
+  echo "# Customer details service" > README.md
+  run_kit integrate
+  
+  assert_no_unpushed_commits
+  assert_last_commit_message "Add README"
+  assert_equal "$(cat README.md)" "# Customer details service"
+}
+
+test_integrate_with_conflicts() {
+  cd "${COLLABORATOR_REPO}"
+  run_kit init
+  run_kit begin <<< "Add empty README"
+  echo "" > README.md
+  run_kit integrate
+  
+  run_kit begin <<< "Add build script"
+  echo "dune build customer-details.exe" > build.sh
+  run_kit integrate
+  
+  cd "${TEST_REPO}"
+  run_kit init
+  run_kit begin <<< "Add build script and skeleton README"
+  echo "# Customer details service" > README.md
+  echo "dune build customer_details.exe" > build.sh
+  run_kit integrate
+  
+  # Conflict #1 - accept my change
+  echo "# Customer details service" > README.md
+  run_kit integrate
+
+  # Conflict #2 - accept their change
+  echo "dune build customer-details.exe" > build.sh
+  run_kit integrate
+  
+  assert_no_unpushed_commits
+  assert_last_commit_message "Add build script and skeleton README"
+  assert_equal "$(cat README.md)" "# Customer details service"
+  assert_equal "$(cat build.sh)" "dune build customer-details.exe"
+}
+
+test_init_with_no_kit_dir() {
+  run_kit init
+  
+  assert_dir_exists .kit
+}
+
+test_init_with_kit_dir() {
+  run_kit init
+  run_kit init
+  
+  assert_equal "${LAST_OUTPUT}" "Kit is already initialised!"
+}
+
+run_test "init when the .kit dir does not yet exist" test_init_with_no_kit_dir
+run_test "init when the .kit dir already exists" test_init_with_kit_dir
+run_test "begin when no change in progress" test_begin_no_change_in_progress
+run_test "begin when a change is in progress" test_begin_change_in_progress
+run_test "backout when no change is in progress" test_backout_no_change_in_progress
+run_test "backout when a change is in progress" test_backout_change_in_progress
+run_test "backout when there are remote changes to integrate" test_backout_with_remote_changes
+run_test "current when no change is in progress" test_current_no_change_in_progress
+run_test "integrate when there is nothing to integrate from either side" test_integrate_no_changes_either_side
+run_test "integrate when there is a local change" test_integrate_local_change
+run_test "integrate when there are only non-local changes" test_integrate_non_local_changes
+run_test "integrate when there is a local change that does not conflict with remote changes" test_integrate_local_and_remote_changes
+run_test "integrate when there is a conflict" test_integrate_with_conflict
+run_test "integrate when there are multiple conflicts" test_integrate_with_conflicts
+

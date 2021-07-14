@@ -1,0 +1,176 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+KIT_DATA_DIR=".kit"
+
+# Setup a change to perform in the current codebase. Prompt the user(s) for a description of the change.
+# If a change is already in progress, displays a message and exits iwth a non-zero code.
+begin() {
+  
+  if test -f "${KIT_DATA_DIR}/current"; then
+    echo "A change is already in-progress!"
+  else 
+    echo "What is the change you wish to make?"
+    read change
+
+    printf "${change}\n" > "${KIT_DATA_DIR}/current"  
+  fi
+  
+  # TODO what to do if there are uncommitted changes in git?
+  # TODO what to do if not in a repo?
+}
+
+# Backs out of the currently in-progress change by resetting git to HEAD.
+# If no change is in progress, displays a message and exits with a non-zero code.
+backout() {
+
+  if test -f "${KIT_DATA_DIR}/current"; then
+    run_git "Backing out of current changes" clean -fd
+    local change=$(cat "${KIT_DATA_DIR}/current")
+    rm "${KIT_DATA_DIR}/current"
+    echo "Backed out of:"
+    echo "--------------"
+    echo $change
+  else
+    echo "No change is currently in progress!"
+  fi
+    
+  integrate_incoming
+}
+
+
+# Displays the currently in-progress change.
+# If no change is in progress, displays a message and exits with a non-zero code.
+current() {
+
+  if test -f "${KIT_DATA_DIR}/current"; then
+    local change=$(cat "${KIT_DATA_DIR}/current")
+    echo $change
+  else
+    echo "No change is currently in-progress!"
+  fi
+
+}
+
+# Creates the kit data directory if it does not yet exist.
+init() {
+  
+  if ! test -d "${KIT_DATA_DIR}"; then
+    mkdir "${KIT_DATA_DIR}"
+  else 
+    echo "Kit is already initialised!"
+  fi
+  
+}
+
+# Integrates the current change with trunk.
+# If there are conflicts, moves kit into conflict mode - conflicts must be resolved, then a new call to integrate made until no conflicts remain
+# Incoming changes are reported to the user.
+integrate() {
+  
+  if test -f "${KIT_DATA_DIR}/current"; then
+    local change=$(cat "${KIT_DATA_DIR}/current")
+
+    run_git "Adding local changes for integration" add .
+    
+    if test -f "${KIT_DATA_DIR}/CONFLICT"; then
+      run_git "Rebasing during integration due to conflict" rebase --continue
+    else
+      run_git "Committing local changes for integration" commit -am "${change}"
+      integrate_incoming
+    fi
+    
+    if [[ "$(git status | head -1)" == "rebase in progress;"* ]]; then
+      touch "${KIT_DATA_DIR}/CONFLICT"
+      echo "There are conflicts with an incoming change - please resolve these then re-run 'kit integrate'"
+    else
+      if test -f "${KIT_DATA_DIR}/CONFLICT"; then
+        rm "${KIT_DATA_DIR}/CONFLICT" 2> /dev/null
+      fi
+    
+      echo "Integrating:"
+      echo "------------"
+      echo "$change"
+      run_git "Pushing local changes for integration" push
+      rm "${KIT_DATA_DIR}/current"
+    fi
+
+  else
+    integrate_incoming
+  fi
+  
+}
+
+integrate_incoming() {
+  
+  run_git "Getting remote changes" fetch
+  
+  local incoming=$(git log ..@{u})
+  
+  if [[ "$incoming" != "" ]]; then
+    run_git "Applying remote changes locally" rebase
+
+    echo "Integrating incoming changes:"
+    echo "-----------------------------"
+    echo "${incoming}"
+  else
+    echo "No incoming changes to integrate with"   
+  fi
+  
+}
+
+run_git() {
+  local MESSAGE="$1"
+  shift
+  
+  local GIT_OUTPUT=$(git "$@" 2>&1)
+  
+  echo "---" >> "${KIT_DATA_DIR}/git.log"
+  echo $(date) >> "${KIT_DATA_DIR}/git.log"
+  echo "$MESSAGE" >> "${KIT_DATA_DIR}/git.log"
+  echo "Command: git $@" >> "${KIT_DATA_DIR}/git.log"
+  echo "Output:" >> "${KIT_DATA_DIR}/git.log"
+  echo "" >> "${KIT_DATA_DIR}/git.log"
+  echo "$GIT_OUTPUT" >> "${KIT_DATA_DIR}/git.log"
+}
+
+# Entrypoint of kit, delegating to the appropriate function based on the parameters passed to kit.
+main() {
+  local command="${1:-""}"
+  
+  if [ "$command" != "init" ] && ! test -d "${KIT_DATA_DIR}"; then
+    echo "Not a kit-ready repo! Run 'kit init' to start using kit here"
+    exit 1
+  fi
+  
+  case $command in
+    
+    begin)
+      begin
+      ;;
+      
+    backout)
+      backout
+      ;;
+      
+    current)
+      current
+      ;;
+      
+    init)
+      init
+      ;;
+      
+    integrate)
+      integrate
+      ;;
+      
+    *)
+      echo "Command '$command' unknown. Supported commands include 'begin', 'backout', 'current', 'init', 'integrate'"
+      exit 1
+      ;;
+    
+  esac
+}
+
+main "$@"
